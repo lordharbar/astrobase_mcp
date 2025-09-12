@@ -1,609 +1,552 @@
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-import argparse
+"""
+FastMCP Snowflake Server
+A simplified MCP server for Snowflake integration compatible with FastMCP Cloud.
+"""
+
+import os
 import json
 import logging
-import os
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Optional, TypeAlias
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, Literal, Optional, Tuple, cast
-
-import yaml
 from fastmcp import FastMCP
-from fastmcp.tools import Tool
-from snowflake.connector import DictCursor, connect
-from snowflake.core import Root
+import snowflake.connector
+from snowflake.connector import DictCursor
+from dotenv import load_dotenv
 
-import mcp_server_snowflake.cortex_services.tools as cortex_tools
-from mcp_server_snowflake.environment import (
-    get_spcs_container_token,
-    is_running_in_spcs_container,
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastMCP server
+mcp = FastMCP(
+    name="Snowflake MCP Server",
+    instructions="""
+    A FastMCP server for interacting with Snowflake data warehouse.
+    
+    Available tools:
+    - execute_query: Run SQL queries against Snowflake
+    - list_databases: List all databases in the account
+    - list_schemas: List schemas in a database
+    - list_tables: List tables in a schema
+    - describe_table: Get table structure and metadata
+    - create_table: Create a new table
+    - drop_table: Drop an existing table
+    
+    The server uses environment variables for authentication:
+    - SNOWFLAKE_ACCOUNT
+    - SNOWFLAKE_USER
+    - SNOWFLAKE_PASSWORD
+    - SNOWFLAKE_WAREHOUSE (optional)
+    - SNOWFLAKE_DATABASE (optional)
+    - SNOWFLAKE_SCHEMA (optional)
+    - SNOWFLAKE_ROLE (optional)
+    """
 )
-from mcp_server_snowflake.object_manager.tools import initialize_object_manager_tools
-from mcp_server_snowflake.query_manager.tools import initialize_query_manager_tool
-from mcp_server_snowflake.semantic_manager.tools import (
-    initialize_semantic_manager_tools,
-)
-from mcp_server_snowflake.server_utils import initialize_middleware
-from mcp_server_snowflake.utils import (
-    cleanup_snowflake_service,
-    get_login_params,
-    load_tools_config_resource,
-    sanitize_tool_name,
-    unpack_sql_statement_permissions,
-)
 
-# Used to quantify Snowflake usage
-server_name = "mcp-server-snowflake"
-tag_major_version = 1
-tag_minor_version = 1
-query_tag = {"origin": "sf_sit", "name": "mcp_server"}
-
-logger = logging.getLogger(server_name)
+# Type definitions for Snowflake objects
+@dataclass
+class TableColumn:
+    """Represents a column in a Snowflake table."""
+    name: str
+    datatype: str
+    nullable: bool = True
+    comment: str | None = None
 
 
-class SnowflakeService:
-    """
-    Snowflake service configuration and management.
-
-    This class handles the configuration and setup of Snowflake Cortex services
-    including search, and analyst. It loads service specifications from a
-    YAML configuration file and provides access to service parameters.
-
-    It also handles all Snowflake authentication and connection logic,
-    automatically detecting the environment (container vs external) and
-    providing appropriate authentication parameters for both database
-    connections and REST API calls.
-
-    Parameters
-    ----------
-    service_config_file : str
-        Path to the service configuration YAML file
-    transport : str
-        Transport for the MCP server
-    connection_params : dict
-        Connection parameters for Snowflake connector
-
-    Attributes
-    ----------
-    service_config_file : str
-        Path to configuration file
-    transport : Literal["stdio", "sse", "streamable-http"]
-        Transport for the MCP server
-    search_services : list
-        List of configured search service specifications
-    analyst_services : list
-        List of configured analyst service specifications
-    agent_services : list
-        List of configured agent service specifications
-    sql_statement_allowed : list
-        List of allowed SQL statement types
-    sql_statement_disallowed : list
-        List of disallowed SQL statement types
-    connection : snowflake.connector.Connection
-        Snowflake connection object
-    """
-
-    def __init__(
-        self,
-        service_config_file: str,
-        transport: str,
-        connection_params: dict,
-    ):
-        if service_config_file is None:
-            raise ValueError(
-                "service_config_file cannot be None. Please provide a path to the service configuration file."
-            )
-
-        self.service_config_file = str(Path(service_config_file).expanduser().resolve())
-        self.config_path_uri = Path(self.service_config_file).as_uri()
-        self.transport = cast(Literal["stdio", "sse", "streamable-http"], transport)
-        self.connection_params = connection_params
-        self.search_services = []
-        self.analyst_services = []
-        self.agent_services = []
-        self.sql_statement_allowed = []
-        self.sql_statement_disallowed = []
-        self.object_manager = False
-        self.query_manager = False
-        self.semantic_manager = False
-        self.default_session_parameters: Dict[str, Any] = {}
-        self.query_tag = query_tag if query_tag is not None else None
-        self.tag_major_version = (
-            tag_major_version if tag_major_version is not None else None
-        )
-        self.tag_minor_version = (
-            tag_minor_version if tag_minor_version is not None else None
-        )
-
-        # Environment detection for authentication
-        self._is_spcs_container = is_running_in_spcs_container()
-
-        self.unpack_service_specs()
-        # Persist connection to avoid closing it after each request
-        self.connection = self._get_persistent_connection()
-        self.root = Root(self.connection)
-
-    def unpack_service_specs(self) -> None:
-        """
-        Load and parse service specifications from configuration file.
-
-        Reads the YAML configuration file and extracts service specifications
-        for all services managed by YAML configuration.
-        """
-        try:
-            with open(self.service_config_file, "r") as file:
-                service_config = yaml.safe_load(file)
-        except FileNotFoundError:
-            logger.error(
-                f"Service configuration file not found: {self.service_config_file}"
-            )
-            raise
-        except yaml.YAMLError as e:
-            logger.error(f"Error parsing YAML file: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error loading service config: {e}")
-            raise
-
-        try:
-            self.search_services = service_config.get("search_services", [])
-            self.analyst_services = service_config.get("analyst_services", [])
-            self.agent_services = service_config.get(
-                "agent_services", []
-            )  # Not supported yet
-            self.sql_statement_allowed, self.sql_statement_disallowed = (
-                unpack_sql_statement_permissions(
-                    service_config.get("sql_statement_permissions", [])
-                )
-            )
-            other_services = service_config.get("other_services", {})
-            if other_services is not None:
-                self.object_manager = other_services.get("object_manager", False)
-                self.query_manager = other_services.get("query_manager", False)
-                self.semantic_manager = other_services.get("semantic_manager", False)
-
-        except Exception as e:
-            logger.error(f"Error extracting service specifications: {e}")
-            raise
-
-    def get_api_headers(self) -> Dict[str, str]:
-        """
-        Get authentication headers for REST API calls.
-
-        Returns
-        -------
-        Dict[str, str]
-            HTTP headers with authentication
-        """
-        if self._is_spcs_container:
-            return {
-                "Authorization": f"Bearer {get_spcs_container_token()}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            }
-        else:
-            # For external environments, we need to use the connection token
-            return {
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-                "Authorization": f'Snowflake Token="{self.connection.rest.token}"',
-            }
-
-    def get_api_host(self) -> str:
-        """
-        Get the API host for REST API calls.
-
-        Returns
-        -------
-        str
-            API host URL
-        """
-        if self._is_spcs_container:
-            return os.getenv(
-                "SNOWFLAKE_HOST", self.connection_params.get("account", "")
-            )
-        else:
-            return self.connection.host
-
-    @staticmethod
-    def send_initial_query(connection: Any) -> None:
-        """
-        Send an initial query to the Snowflake service.
-        """
-        with connection.cursor() as cur:
-            cur.execute("SELECT 'MCP Server Snowflake'").fetchone()
-
-    def _get_persistent_connection(
-        self,
-        session_parameters: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """
-        Get a persistent Snowflake connection.
-
-        This method creates a connection that will be kept alive and should be
-        explicitly closed when no longer needed.
-
-        Parameters
-        ----------
-        session_parameters : dict, optional
-            Additional session parameters to add to connection
-        major_version : int, optional
-            Major version of the query tag
-        minor_version : int, optional
-            Minor version of the query tag
-
-        Returns
-        -------
-        connection
-            A Snowflake connection object
-        """
-        try:
-            query_tag_params = self.get_query_tag_param()
-
-            if session_parameters is not None:
-                if query_tag_params:
-                    session_parameters.update(query_tag_params)
-            else:
-                session_parameters = query_tag_params
-
-            # Get connection parameters based on environment
-            if self._is_spcs_container:
-                logger.info("Using SPCS container OAuth authentication")
-                connection_params = {
-                    "host": os.getenv("SNOWFLAKE_HOST"),
-                    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-                    "token": get_spcs_container_token(),
-                    "authenticator": "oauth",
-                }
-                connection_params = {
-                    k: v for k, v in connection_params.items() if v is not None
-                }
-            else:
-                logger.info("Using external authentication")
-                connection_params = self.connection_params.copy()
-
-            # We are passing session_parameters and client_session_keep_alive
-            # so we cannot rely on the connection to infer default connection name.
-            # So instead, if no explicit values passed via CLI, we replicate the same logic here
-            if not connection_params:
-                connection_params = {
-                    "connection_name": os.getenv(
-                        "SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default"
-                    ),
-                }
-
-            connection = connect(
-                **connection_params,
-                session_parameters=session_parameters,
-                client_session_keep_alive=True,
-            )
-            if connection:  # Send zero compute query to capture query tag
-                self.send_initial_query(connection)
-                return connection
-        except Exception as e:
-            logger.error(f"Error establishing persistent Snowflake connection: {e}")
-            raise
-
-    @contextmanager
-    def get_connection(
-        self,
-        use_dict_cursor: bool = False,
-        session_parameters: Optional[Dict[str, Any]] = None,
-    ) -> Generator[Tuple[Any, Any], None, None]:
-        """
-        Get a Snowflake connection with the specified configuration.
-
-        This context manager ensures proper connection handling and cleanup.
-        It automatically detects the environment and uses appropriate authentication.
-
-        If the connection is not established, it will be established with the specified parameters.
-        If the connection is already established, it will be used and session_parameters ignored.
-
-        Parameters
-        ----------
-        use_dict_cursor : bool, default=False
-            Whether to use DictCursor instead of regular cursor
-        session_parameters : dict, optional
-            Additional session parameters to add to connection such as query tag
-
-        Yields
-        ------
-        tuple
-            A tuple containing (connection, cursor)
-
-        Examples
-        --------
-        >>> with service.get_connection(use_dict_cursor=True) as (con, cur):
-        ...     cur.execute("SELECT current_version()")
-        ...     result = cur.fetchone()
-        """
-
-        try:
-            if self.connection is None:
-                # Get connection parameters based on environment
-                if self._is_spcs_container:
-                    logger.info("Using SPCS container OAuth authentication")
-                    connection_params = {
-                        "host": os.getenv("SNOWFLAKE_HOST"),
-                        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-                        "token": get_spcs_container_token(),
-                        "authenticator": "oauth",
-                    }
-                    connection_params = {
-                        k: v for k, v in connection_params.items() if v is not None
-                    }
-                else:
-                    logger.info("Using external authentication")
-                    connection_params = self.connection_params.copy()
-
-                self.connection = connect(
-                    **connection_params,
-                    session_parameters=session_parameters,
-                    client_session_keep_alive=False,
-                )
-
-            cursor = (
-                self.connection.cursor(DictCursor)
-                if use_dict_cursor
-                else self.connection.cursor()
-            )
-
-            try:
-                yield self.connection, cursor
-            finally:
-                cursor.close()
-
-        except Exception as e:
-            logger.error(f"Error establishing Snowflake connection: {e}")
-            raise
-
-    def get_query_tag_param(
-        self,
-    ) -> Optional[Dict[str, Any]] | None:
-        """
-        Get the query tag parameters for the Snowflake service.
-
-        Parameters
-        ----------
-        query_tag : dict[str, str], optional
-            Query tag dictionary
-        major_version : int, optional
-            Major version of the query tag
-        minor_version : int, optional
-            Minor version of the query tag
-        """
-        if self.query_tag is not None:
-            query_tag = self.query_tag.copy()
-            if (
-                self.tag_major_version is not None
-                and self.tag_minor_version is not None
-            ):
-                query_tag["version"] = {
-                    "major": self.tag_major_version,
-                    "minor": self.tag_minor_version,
-                }
-
-            # Set the query tag in default session parameters
-            session_parameters = {"QUERY_TAG": json.dumps(query_tag)}
-
-            return session_parameters
-        else:
-            return None
+@dataclass
+class TableInfo:
+    """Represents information about a Snowflake table."""
+    database_name: str
+    schema_name: str
+    table_name: str
+    columns: list[TableColumn] = field(default_factory=list)
+    comment: str | None = None
+    kind: str = "PERMANENT"  # PERMANENT, TRANSIENT, TEMPORARY
 
 
-def get_var(var_name: str, env_var_name: str, args) -> Optional[str]:
-    """
-    Retrieve variable value from command line arguments or environment variables.
-
-    Checks for a variable value first in command line arguments, then falls back
-    to environment variables. This provides flexible configuration options for
-    the MCP server.
-
-    Parameters
-    ----------
-    var_name : str
-        The attribute name to check in the command line arguments object
-    env_var_name : str
-        The environment variable name to check if command line arg is not provided
-    args : argparse.Namespace
-        Parsed command line arguments object
-
-    Returns
-    -------
-    Optional[str]
-        The variable value if found in either source, None otherwise
-
-    Examples
-    --------
-    Get account identifier from args or environment:
-
-    >>> args = parser.parse_args(["--account", "myaccount"])
-    >>> get_var("account", "SNOWFLAKE_ACCOUNT", args)
-    'myaccount'
-
-    >>> os.environ["SNOWFLAKE_ACCOUNT"] = "myaccount"
-    >>> args = parser.parse_args([])
-    >>> get_var("account", "SNOWFLAKE_ACCOUNT", args)
-    'myaccount'
-    """
-
-    if getattr(args, var_name):
-        return getattr(args, var_name)
-    if env_var_name in os.environ:
-        return os.environ[env_var_name]
-    return None
-
-
-def parse_arguments():
-    """Parse command line arguments once at startup."""
-    parser = argparse.ArgumentParser(description="Snowflake MCP Server")
-
-    login_params = get_login_params()
-
-    for value in login_params.values():
-        parser.add_argument(
-            *value[:-2], required=False, default=value[-2], help=value[-1]
-        )
-
-    parser.add_argument(
-        "--service-config-file",
-        required=False,
-        help="Path to service specification file",
-    )
-    parser.add_argument(
-        "--transport",
-        required=False,
-        choices=["stdio", "sse", "streamable-http"],
-        help="Transport for the MCP server",
-        default="stdio",
-    )
-
-    return parser.parse_args()
-
-
-def create_lifespan(args):
-    """Create a lifespan function with captured arguments."""
-
-    @asynccontextmanager
-    async def create_snowflake_service(
-        server: FastMCP,
-    ) -> AsyncIterator[SnowflakeService]:
-        """
-        Create main entry point for the Snowflake MCP server package.
-
-        Uses pre-parsed command line arguments to create and configure the Snowflake service.
-        """
-        connection_params = {
-            key: getattr(args, key)
-            for key in get_login_params().keys()
-            if getattr(args, key) is not None
+class SnowflakeConnection:
+    """Manages Snowflake database connections."""
+    
+    def __init__(self):
+        self.connection_params = self._get_connection_params()
+    
+    def _get_connection_params(self) -> dict[str, Any]:
+        """Get connection parameters from environment variables."""
+        params = {
+            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+            "user": os.getenv("SNOWFLAKE_USER"),
+            "password": os.getenv("SNOWFLAKE_PASSWORD"),
         }
-        service_config_file = get_var(
-            "service_config_file", "SERVICE_CONFIG_FILE", args
-        )
-
-        snowflake_service = None
+        
+        # Add optional parameters if provided
+        optional_params = {
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+            "database": os.getenv("SNOWFLAKE_DATABASE"),
+            "schema": os.getenv("SNOWFLAKE_SCHEMA"),
+            "role": os.getenv("SNOWFLAKE_ROLE"),
+        }
+        
+        for key, value in optional_params.items():
+            if value:
+                params[key] = value
+        
+        # Remove None values
+        return {k: v for k, v in params.items() if v is not None}
+    
+    def get_connection(self, use_dict_cursor: bool = True):
+        """Create a Snowflake connection."""
         try:
-            snowflake_service = SnowflakeService(
-                service_config_file=service_config_file,
-                transport=args.transport,
-                connection_params=connection_params,
-            )
-
-            # Initialize tools and resources now that we have the service
-            logger.info("Initializing tools and resources...")
-            initialize_tools(snowflake_service, server)
-            initialize_middleware(server, snowflake_service)
-            initialize_resources(snowflake_service, server)
-
-            yield snowflake_service
+            conn = snowflake.connector.connect(**self.connection_params)
+            if use_dict_cursor:
+                return conn, conn.cursor(DictCursor)
+            return conn, conn.cursor()
         except Exception as e:
-            logger.error(f"Error creating Snowflake service: {e}")
+            logger.error(f"Failed to connect to Snowflake: {e}")
             raise
 
+    def execute_query(self, query: str) -> list[dict]:
+        """Execute a query and return results."""
+        conn, cursor = self.get_connection(use_dict_cursor=True)
+        try:
+            cursor.execute(query)
+            results = cursor.fetchall()
+            return results
         finally:
-            if snowflake_service is not None:
-                cleanup_snowflake_service(snowflake_service)
-
-    return create_snowflake_service
+            cursor.close()
+            conn.close()
 
 
-def initialize_resources(snowflake_service: SnowflakeService, server: FastMCP):
-    @server.resource(snowflake_service.config_path_uri)
-    async def get_tools_config():
-        """
-        Tools Specification Configuration.
-
-        Provides access to the YAML tools configuration file as JSON.
-        """
-        tools_config = await load_tools_config_resource(
-            snowflake_service.service_config_file
-        )
-        return json.loads(tools_config)
+# Create a global connection manager
+sf_conn = SnowflakeConnection()
 
 
-def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
-    if snowflake_service is not None:
-        # Add tools for object manager
-        if snowflake_service.object_manager:
-            initialize_object_manager_tools(server, snowflake_service)
+# ============================================================================
+# MCP Tools
+# ============================================================================
 
-        # Add tools for query manager
-        if snowflake_service.query_manager:
-            initialize_query_manager_tool(server, snowflake_service)
-
-        # Add tools for semantic manager
-        if snowflake_service.semantic_manager:
-            initialize_semantic_manager_tools(server, snowflake_service)
-
-        # Add tools for each configured search service
-        if snowflake_service.search_services:
-            for service in snowflake_service.search_services:
-                search_wrapper = cortex_tools.create_search_wrapper(
-                    snowflake_service=snowflake_service, service_details=service
-                )
-                server.add_tool(
-                    Tool.from_function(
-                        fn=search_wrapper,
-                        name=sanitize_tool_name(service.get("service_name")),
-                        description=service.get(
-                            "description",
-                            f"Search service: {service.get('service_name')}",
-                        ),
-                    )
-                )
-
-        if snowflake_service.analyst_services:
-            for service in snowflake_service.analyst_services:
-                cortex_analyst_wrapper = cortex_tools.create_cortex_analyst_wrapper(
-                    snowflake_service=snowflake_service, service_details=service
-                )
-                server.add_tool(
-                    Tool.from_function(
-                        fn=cortex_analyst_wrapper,
-                        name=sanitize_tool_name(service.get("service_name")),
-                        description=service.get(
-                            "description",
-                            f"Analyst service: {service.get('service_name')}",
-                        ),
-                    )
-                )
-
-
-def main():
-    args = parse_arguments()
-
-    # Create server with lifespan that has access to args
-    server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args))
-
+@mcp.tool()
+def execute_query(query: str, limit: int | None = None) -> str:
+    """
+    Execute a SQL query on Snowflake and return the results.
+    
+    Args:
+        query: The SQL query to execute
+        limit: Optional limit on number of rows to return
+    
+    Returns:
+        JSON string containing query results or error message
+    """
     try:
-        logger.info("Starting Snowflake MCP Server...")
-
-        if args.transport and args.transport in [
-            "sse",
-            "streamable-http",
-        ]:
-            logger.info(f"Starting server with transport: {args.transport}")
-            server.run(transport=args.transport, host="0.0.0.0", port=9000)
-        else:
-            logger.info(f"Starting server with transport: {args.transport or 'stdio'}")
-            server.run(transport=args.transport or "stdio")
-
+        # Add limit if specified and not already in query
+        if limit and "LIMIT" not in query.upper():
+            query = f"{query.rstrip(';')} LIMIT {limit}"
+        
+        results = sf_conn.execute_query(query)
+        
+        # Convert any non-serializable types
+        for row in results:
+            for key, value in row.items():
+                if hasattr(value, 'isoformat'):  # datetime objects
+                    row[key] = value.isoformat()
+        
+        return json.dumps({
+            "success": True,
+            "row_count": len(results),
+            "data": results
+        }, indent=2)
+    
     except Exception as e:
-        logger.error(f"Error starting MCP server: {e}")
-        raise
+        logger.error(f"Query execution failed: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
 
+
+@mcp.tool()
+def list_databases(pattern: str | None = None) -> str:
+    """
+    List all databases in the Snowflake account.
+    
+    Args:
+        pattern: Optional pattern to filter database names (SQL LIKE pattern)
+    
+    Returns:
+        JSON string containing list of databases
+    """
+    try:
+        query = "SHOW DATABASES"
+        if pattern:
+            query += f" LIKE '{pattern}'"
+        
+        results = sf_conn.execute_query(query)
+        
+        databases = [
+            {
+                "name": row.get("name"),
+                "owner": row.get("owner"),
+                "comment": row.get("comment"),
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+            }
+            for row in results
+        ]
+        
+        return json.dumps({
+            "success": True,
+            "count": len(databases),
+            "databases": databases
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to list databases: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@mcp.tool()
+def list_schemas(database_name: str, pattern: str | None = None) -> str:
+    """
+    List all schemas in a specific database.
+    
+    Args:
+        database_name: Name of the database
+        pattern: Optional pattern to filter schema names (SQL LIKE pattern)
+    
+    Returns:
+        JSON string containing list of schemas
+    """
+    try:
+        query = f"SHOW SCHEMAS IN DATABASE {database_name}"
+        if pattern:
+            query += f" LIKE '{pattern}'"
+        
+        results = sf_conn.execute_query(query)
+        
+        schemas = [
+            {
+                "name": row.get("name"),
+                "database_name": row.get("database_name"),
+                "owner": row.get("owner"),
+                "comment": row.get("comment"),
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+            }
+            for row in results
+        ]
+        
+        return json.dumps({
+            "success": True,
+            "database": database_name,
+            "count": len(schemas),
+            "schemas": schemas
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to list schemas: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@mcp.tool()
+def list_tables(
+    database_name: str,
+    schema_name: str,
+    pattern: str | None = None,
+    include_views: bool = False
+) -> str:
+    """
+    List all tables in a specific schema.
+    
+    Args:
+        database_name: Name of the database
+        schema_name: Name of the schema
+        pattern: Optional pattern to filter table names (SQL LIKE pattern)
+        include_views: Whether to include views in the results
+    
+    Returns:
+        JSON string containing list of tables
+    """
+    try:
+        query = f"SHOW TABLES IN SCHEMA {database_name}.{schema_name}"
+        if pattern:
+            query += f" LIKE '{pattern}'"
+        
+        results = sf_conn.execute_query(query)
+        
+        tables = []
+        for row in results:
+            # Skip views if not requested
+            if not include_views and row.get("kind") == "VIEW":
+                continue
+            
+            tables.append({
+                "name": row.get("name"),
+                "database_name": row.get("database_name"),
+                "schema_name": row.get("schema_name"),
+                "kind": row.get("kind"),
+                "comment": row.get("comment"),
+                "rows": row.get("rows"),
+                "bytes": row.get("bytes"),
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+            })
+        
+        return json.dumps({
+            "success": True,
+            "database": database_name,
+            "schema": schema_name,
+            "count": len(tables),
+            "tables": tables
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to list tables: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@mcp.tool()
+def describe_table(
+    database_name: str,
+    schema_name: str,
+    table_name: str
+) -> str:
+    """
+    Get detailed information about a table including columns and metadata.
+    
+    Args:
+        database_name: Name of the database
+        schema_name: Name of the schema
+        table_name: Name of the table
+    
+    Returns:
+        JSON string containing table structure and metadata
+    """
+    try:
+        # Get column information
+        query = f"DESCRIBE TABLE {database_name}.{schema_name}.{table_name}"
+        columns_result = sf_conn.execute_query(query)
+        
+        columns = [
+            {
+                "name": row.get("name"),
+                "type": row.get("type"),
+                "nullable": row.get("null?") == "Y",
+                "default": row.get("default"),
+                "primary_key": row.get("primary key") == "Y",
+                "unique_key": row.get("unique key") == "Y",
+                "comment": row.get("comment")
+            }
+            for row in columns_result
+        ]
+        
+        # Get table metadata
+        info_query = f"SHOW TABLES LIKE '{table_name}' IN SCHEMA {database_name}.{schema_name}"
+        info_result = sf_conn.execute_query(info_query)
+        
+        table_info = {}
+        if info_result:
+            row = info_result[0]
+            table_info = {
+                "kind": row.get("kind"),
+                "comment": row.get("comment"),
+                "rows": row.get("rows"),
+                "bytes": row.get("bytes"),
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None,
+                "owner": row.get("owner")
+            }
+        
+        return json.dumps({
+            "success": True,
+            "database": database_name,
+            "schema": schema_name,
+            "table": table_name,
+            "info": table_info,
+            "columns": columns
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to describe table: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@mcp.tool()
+def create_table(
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    columns: list[dict],
+    comment: str | None = None,
+    replace_if_exists: bool = False
+) -> str:
+    """
+    Create a new table in Snowflake.
+    
+    Args:
+        database_name: Name of the database
+        schema_name: Name of the schema
+        table_name: Name of the table to create
+        columns: List of column definitions, each with 'name', 'type', and optional 'nullable', 'default', 'comment'
+        comment: Optional comment for the table
+        replace_if_exists: Whether to replace the table if it already exists
+    
+    Returns:
+        JSON string indicating success or failure
+    """
+    try:
+        # Build CREATE TABLE statement
+        create_or_replace = "CREATE OR REPLACE" if replace_if_exists else "CREATE"
+        
+        column_defs = []
+        for col in columns:
+            col_def = f"{col['name']} {col['type']}"
+            
+            if not col.get('nullable', True):
+                col_def += " NOT NULL"
+            
+            if 'default' in col:
+                col_def += f" DEFAULT {col['default']}"
+            
+            if 'comment' in col:
+                col_def += f" COMMENT '{col['comment']}'"
+            
+            column_defs.append(col_def)
+        
+        query = f"{create_or_replace} TABLE {database_name}.{schema_name}.{table_name} (\n"
+        query += ",\n".join(f"    {col_def}" for col_def in column_defs)
+        query += "\n)"
+        
+        if comment:
+            query += f" COMMENT = '{comment}'"
+        
+        sf_conn.execute_query(query)
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Table {database_name}.{schema_name}.{table_name} created successfully",
+            "query": query
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to create table: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@mcp.tool()
+def drop_table(
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    if_exists: bool = True
+) -> str:
+    """
+    Drop a table from Snowflake.
+    
+    Args:
+        database_name: Name of the database
+        schema_name: Name of the schema
+        table_name: Name of the table to drop
+        if_exists: Whether to use IF EXISTS clause
+    
+    Returns:
+        JSON string indicating success or failure
+    """
+    try:
+        if_exists_clause = "IF EXISTS " if if_exists else ""
+        query = f"DROP TABLE {if_exists_clause}{database_name}.{schema_name}.{table_name}"
+        
+        sf_conn.execute_query(query)
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Table {database_name}.{schema_name}.{table_name} dropped successfully",
+            "query": query
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Failed to drop table: {e}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+@mcp.resource("snowflake://connection-info")
+def get_connection_info() -> dict:
+    """
+    Get current Snowflake connection information.
+    
+    Returns connection parameters (excluding sensitive information).
+    """
+    params = sf_conn.connection_params.copy()
+    # Remove sensitive information
+    params.pop("password", None)
+    
+    return {
+        "connection_params": params,
+        "configured": bool(params.get("account") and params.get("user"))
+    }
+
+
+@mcp.resource("snowflake://query-examples")
+def get_query_examples() -> dict:
+    """
+    Get example SQL queries for common Snowflake operations.
+    """
+    return {
+        "examples": [
+            {
+                "description": "Show current warehouse",
+                "query": "SHOW WAREHOUSES"
+            },
+            {
+                "description": "Get current database and schema",
+                "query": "SELECT CURRENT_DATABASE(), CURRENT_SCHEMA()"
+            },
+            {
+                "description": "List all tables with row counts",
+                "query": "SHOW TABLES"
+            },
+            {
+                "description": "Query sample data",
+                "query": "SELECT * FROM table_name LIMIT 10"
+            },
+            {
+                "description": "Get table DDL",
+                "query": "SELECT GET_DDL('TABLE', 'database.schema.table_name')"
+            },
+            {
+                "description": "Show user privileges",
+                "query": "SHOW GRANTS TO USER"
+            }
+        ]
+    }
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    # Run the server
+    # For FastMCP Cloud, this block will be ignored
+    # For local testing, use: python snowflake_server.py
+    mcp.run()

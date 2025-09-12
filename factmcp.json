@@ -1,0 +1,84 @@
+{
+  "name": "Snowflake MCP Server",
+  "version": "2.0.0",
+  "description": "A FastMCP server for interacting with Snowflake data warehouse, providing tools for querying, managing databases, schemas, and tables.",
+  "author": {
+    "name": "Your Organization",
+    "url": "https://github.com/yourusername/snowflake-mcp-server"
+  },
+  "server": {
+    "entrypoint": "snowflake_server.py:mcp",
+    "transport": "streamable-http",
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "environment": {
+    "required": [
+      "SNOWFLAKE_ACCOUNT",
+      "SNOWFLAKE_USER",
+      "SNOWFLAKE_PASSWORD"
+    ],
+    "optional": [
+      "SNOWFLAKE_WAREHOUSE",
+      "SNOWFLAKE_DATABASE",
+      "SNOWFLAKE_SCHEMA",
+      "SNOWFLAKE_ROLE"
+    ]
+  },
+  "tools": [
+    {
+      "name": "execute_query",
+      "description": "Execute SQL queries against Snowflake"
+    },
+    {
+      "name": "list_databases",
+      "description": "List all databases in the account"
+    },
+    {
+      "name": "list_schemas",
+      "description": "List schemas in a database"
+    },
+    {
+      "name": "list_tables",
+      "description": "List tables in a schema"
+    },
+    {
+      "name": "describe_table",
+      "description": "Get table structure and metadata"
+    },
+    {
+      "name": "create_table",
+      "description": "Create a new table"
+    },
+    {
+      "name": "drop_table",
+      "description": "Drop an existing table"
+    }
+  ],
+  "resources": [
+    {
+      "uri": "snowflake://connection-info",
+      "description": "Get current Snowflake connection information"
+    },
+    {
+      "uri": "snowflake://query-examples",
+      "description": "Get example SQL queries for common operations"
+    }
+  ],
+  "authentication": {
+    "type": "environment",
+    "description": "Uses environment variables for Snowflake authentication"
+  },
+  "deployment": {
+    "fastmcp_cloud": {
+      "enabled": true,
+      "public": false,
+      "organization_only": true
+    },
+    "self_hosted": {
+      "docker": true,
+      "cloud_run": true,
+      "kubernetes": true
+    }
+  }
+}
