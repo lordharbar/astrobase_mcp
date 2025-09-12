@@ -550,8 +550,13 @@ def get_query_examples() -> dict:
 # Main entry point
 # ============================================================================
 
+def main():
+    """Main entry point for the server."""
+    mcp.run()
+
+
 if __name__ == "__main__":
     # Run the server
     # For FastMCP Cloud, this block will be ignored
     # For local testing, use: python mcp_server_snowflake/server.py
-    mcp.run()
+    main()
