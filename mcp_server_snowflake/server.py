@@ -1,21 +1,26 @@
 """
 FastMCP Snowflake Server
-A simplified MCP server for Snowflake integration compatible with FastMCP Cloud.
+Located in mcp_server_snowflake/server.py
 """
 
 import os
 import json
 import logging
-from typing import Any, Optional, TypeAlias
+from typing import Any, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
+
 from fastmcp import FastMCP
 import snowflake.connector
 from snowflake.connector import DictCursor
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from parent directory if needed
+env_path = Path(__file__).parent.parent / '.env'
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -548,5 +553,5 @@ def get_query_examples() -> dict:
 if __name__ == "__main__":
     # Run the server
     # For FastMCP Cloud, this block will be ignored
-    # For local testing, use: python snowflake_server.py
+    # For local testing, use: python mcp_server_snowflake/server.py
     mcp.run()

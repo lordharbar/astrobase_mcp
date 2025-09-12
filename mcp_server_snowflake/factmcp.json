@@ -7,7 +7,7 @@
     "url": "https://github.com/yourusername/snowflake-mcp-server"
   },
   "server": {
-    "entrypoint": "snowflake_server.py:mcp",
+    "entrypoint": "mcp_server_snowflake/server.py:mcp",
     "transport": "streamable-http",
     "host": "0.0.0.0",
     "port": 8000
@@ -76,7 +76,7 @@
       "organization_only": true
     },
     "self_hosted": {
-      "docker": true,
+      "docker": false,
       "cloud_run": true,
       "kubernetes": true
     }
