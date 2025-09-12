@@ -129,6 +129,17 @@ class SnowflakeConnection:
 sf_conn = SnowflakeConnection()
 
 
+# Helper function for datetime formatting
+def format_datetime(value: Any) -> str | None:
+    """Safely format datetime values to ISO format."""
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except (AttributeError, TypeError):
+        return str(value) if value else None
+
+
 # ============================================================================
 # MCP Tools
 # ============================================================================
@@ -195,7 +206,7 @@ def list_databases(pattern: str | None = None) -> str:
                 "name": row.get("name"),
                 "owner": row.get("owner"),
                 "comment": row.get("comment"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
+                "created_on": format_datetime(row.get("created_on"))
             }
             for row in results
         ]
@@ -239,7 +250,7 @@ def list_schemas(database_name: str, pattern: str | None = None) -> str:
                 "database_name": row.get("database_name"),
                 "owner": row.get("owner"),
                 "comment": row.get("comment"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
+                "created_on": format_datetime(row.get("created_on"))
             }
             for row in results
         ]
@@ -299,7 +310,7 @@ def list_tables(
                 "comment": row.get("comment"),
                 "rows": row.get("rows"),
                 "bytes": row.get("bytes"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
+                "created_on": format_datetime(row.get("created_on"))
             })
         
         return json.dumps({
@@ -365,7 +376,7 @@ def describe_table(
                 "comment": row.get("comment"),
                 "rows": row.get("rows"),
                 "bytes": row.get("bytes"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None,
+                "created_on": format_datetime(row.get("created_on")),
                 "owner": row.get("owner")
             }
         
