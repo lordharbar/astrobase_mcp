@@ -3,17 +3,17 @@ FastMCP Snowflake Server
 Located in mcp_server_snowflake/server.py
 """
 
-import os
 import json
 import logging
-from typing import Any, Optional
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from fastmcp import FastMCP
 import snowflake.connector
-from snowflake.connector import DictCursor
 from dotenv import load_dotenv
+from fastmcp import FastMCP
+from snowflake.connector import DictCursor
 
 # Load environment variables from parent directory if needed
 env_path = Path(__file__).parent.parent / '.env'
@@ -113,7 +113,7 @@ class SnowflakeConnection:
             logger.error(f"Failed to connect to Snowflake: {e}")
             raise
 
-    def execute_query(self, query: str) -> list[dict]:
+    def execute_query(self, query: str) -> list[dict[str, Any]]:
         """Execute a query and return results."""
         conn, cursor = self.get_connection(use_dict_cursor=True)
         try:
@@ -195,7 +195,7 @@ def list_databases(pattern: str | None = None) -> str:
                 "name": row.get("name"),
                 "owner": row.get("owner"),
                 "comment": row.get("comment"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
             }
             for row in results
         ]
@@ -239,7 +239,7 @@ def list_schemas(database_name: str, pattern: str | None = None) -> str:
                 "database_name": row.get("database_name"),
                 "owner": row.get("owner"),
                 "comment": row.get("comment"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
             }
             for row in results
         ]
@@ -299,7 +299,7 @@ def list_tables(
                 "comment": row.get("comment"),
                 "rows": row.get("rows"),
                 "bytes": row.get("bytes"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None
             })
         
         return json.dumps({
@@ -365,7 +365,7 @@ def describe_table(
                 "comment": row.get("comment"),
                 "rows": row.get("rows"),
                 "bytes": row.get("bytes"),
-                "created_on": row.get("created_on").isoformat() if row.get("created_on") else None,
+                "created_on": row.get("created_on").isoformat() if row.get("created_on") and hasattr(row.get("created_on"), 'isoformat') else None,
                 "owner": row.get("owner")
             }
         
