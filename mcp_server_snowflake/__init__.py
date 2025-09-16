@@ -1,14 +1,5 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Snowflake MCP Server Package.
 
@@ -20,9 +11,9 @@ standardized protocol interface.
 The package supports:
 - Cortex Search: Semantic search across Snowflake data
 - Cortex Analyst: Natural language to SQL query generation
-
-The server can be configured through command-line arguments or environment
-variables and uses a YAML configuration file to define service specifications.
+- Object Management: Create, drop, and manage Snowflake objects
+- Query Management: Execute SQL queries with permission controls
+- Semantic Views: Work with Snowflake semantic views
 
 Environment Variables
 ---------------------
@@ -36,6 +27,7 @@ SERVICE_CONFIG_FILE : str
     Path to service configuration file (alternative to --service-config-file)
 """
 
-from mcp_server_snowflake.server import main
+from mcp_server_snowflake.server import mcp, main
 
-__all__ = ["main"]
+__all__ = ["mcp", "main"]
+__version__ = "2.0.0"
