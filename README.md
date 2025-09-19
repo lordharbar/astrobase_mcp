@@ -89,7 +89,7 @@ This server implements MCP for Snowflake, meaning any MCP-compatible AI client (
 ┌──────────▼──────────┐
 │  Snowflake Account  │
 │  ┌───────────────┐  │
-│  │   Databases    │  │
+│  │   Databases   │  │
 │  ├───────────────┤  │
 │  │  Cortex AI    │  │
 │  ├───────────────┤  │
@@ -126,14 +126,13 @@ cd snowflake-mcp-server
 ### Step 2: Create Virtual Environment
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv venv
 ```
 
 ### Step 3: Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ### Step 4: Set Up Environment Variables
